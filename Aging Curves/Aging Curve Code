@@ -1,0 +1,774 @@
+---
+title: "Aging Curves in the NWHL"
+author: "Ben Howell"
+date: "7/12/2021"
+output:
+  html_document:
+    highlighter: null
+    theme: "flatly"
+    code_download: TRUE
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, include = FALSE, fig.align = "center",
+                      fig.width = 7, fig.height = 5, warning = FALSE, message = FALSE)
+```
+       
+******************************************************************
+           
+```{r}
+library(pacman)
+library(knitr)
+library(kableExtra)
+library(reactable)
+
+pacman::p_load(tidyverse, ggthemes,
+               mgcv, radiant.data, doFuture, future.apply, janitor)
+#load in libraries that we'll use for this analysis
+```
+
+```{r}
+df <- read.csv("survive.csv")
+
+#we're loading in the NWHL data from TheirHockeyCounts here
+nwhl <- read.csv("nwhl_data.csv") %>%
+  mutate(League = "NWHL") %>%
+  clean_names() %>%
+  #this is just where I add on all the necessary columns to make it possible to bind
+  #the NWHL data with the CWHL data
+  #an initial version of the project looked at both leagues, but I didn't end up doing so
+  mutate(pos = p, sh_o = NA, w = NA, l = NA, ga = NA, gaa = NA, 
+         ena = NA, sa = NA, sp = NA, min = NA, shg = NA, gwg = NA, a = a1 + a2, 
+         pts = a + g, ppg = pts / gp, sec = NA, t = NA, season_type = NA, 
+         player_id = NA, pm = NA) %>%
+  dplyr::select(-p) %>%
+  mutate(tmgms = ifelse(team == "BOS", 7, 
+                        ifelse(team == "BUF", 6, 
+                             ifelse(team == "CTW", 4, 
+                                    ifelse(team == "MET", 3, ifelse(team == "MIN", 4, 6))))),
+    gp = ifelse(start_year %in% c(2020), round((gp / tmgms) * 24), gp))
+  #adding in the adjusted games for the 2021 season
+  #since 2021 was very short, we want to scale up to a full seasons worth of games 
+  #just so that we don't get any weird weighting in our weighted averages
+
+# CWHL data load in
+cwhl_all <- read.csv("cwhl_data.csv") %>%
+  mutate(League = "CWHL")
+
+cwhl <- cwhl_all %>%
+  clean_names() %>%
+  dplyr::select(-c(tournament_id, team_award, rookie)) %>%
+  separate(season, into = c("start_year", "end_year"), sep = "-", remove = FALSE) %>%
+  filter(season_type == "Regular Season") %>%
+  #obviously we just want regular season games
+  mutate(team = team_id,
+         player = player_id, dob = NA, 
+         age_in_season = age,
+         a1 = NA, a2 = NA, sog = NA, fow = NA, fol = NA, pen_t = NA) %>%
+  dplyr::select(-c(team_id, age))
+```
+
+```{r}
+#modeling CWHL game score for weights to be used in eventual MARCEL projections
+set.seed(111)
+#gonna model game score per game as a function of goals and assists
+gs_mod <- lm(game_score ~ g + a, data = nwhl)
+#very strong performance in modeling overall game score off total goals/assists
+summary(gs_mod)
+#r-squared of 0.9652 is excellent
+```
+
+```{r, include=TRUE}
+cwhl$game_score <- predict(gs_mod, newdata = cwhl)
+
+cwhl <- cwhl %>%
+  mutate(game_score_game = game_score / gp) %>%
+  dplyr::select(player, age_in_season, league, team, season, start_year, end_year, 
+                gp, g, a, game_score, game_score_game)
+
+nwhl <- nwhl %>%
+  dplyr::select(player, age_in_season, league, team, season, start_year, end_year, 
+                gp, g, a, game_score, game_score_game)
+
+gs_graph <- cwhl %>%
+  filter(game_score_game < 3.5) %>%
+  slice_sample(n = 578) %>%
+  rbind(nwhl) %>%
+  ggplot() +
+  geom_density(aes(x = game_score_game, fill = league), alpha = 0.6) +
+  labs(title = "Comparing Distributions of Game Score by League",  
+       caption = "@benhowell71 on Twitter | benhowell71.com", fill = "League",
+       x = "Game Score Per Game",
+       y = "Frequency") +
+  #geom_vline(xintercept = weighted.mean(x = game_score_game, w = gp)) +
+  scale_fill_colorblind() +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+        panel.grid.major = element_blank(),
+        plot.caption = element_text(hjust = 0.5, face = "italic"),
+        legend.text = element_text(size = 10),
+        legend.key.size = unit(1.5, 'lines'))
+```
+
+```{r}
+# determining weights for each season of play
+three_year <- cwhl %>%
+  group_by(player) %>%
+  arrange(player, season) %>%
+  mutate(yrs = n(),
+         n1_year = lag(start_year, 1),
+         n1_gmscore = lag(game_score_game, 1),
+         n1_gp = lag(gp, 1),
+         n2_year = lag(start_year, 2),
+         n2_gmscore = lag(game_score_game, 2),
+         n2_gp = lag(gp, 2),
+         n3_year = lag(start_year, 3),
+         n3_gmscore = lag(game_score_game, 3),
+         n3_gp = lag(gp, 3))
+
+weights <- three_year %>% 
+  filter_at(vars(game_score_game, n1_gmscore, n2_gmscore, n3_gmscore), all_vars(!is.infinite(.))) %>%
+  filter(! is.na(n3_gmscore) & ! is.na(game_score_game) & ! is.na(n2_gmscore) & ! is.na(n1_gmscore)) %>%
+  dplyr::select(player, age_in_season, start_year, gp, g, a, game_score:n3_gp) %>%
+  ungroup() %>%
+  dplyr::select(n1_gmscore, n2_gmscore, n3_gmscore, game_score_game) %>%
+  cor() %>% 
+  as.data.frame() %>%
+  rownames_to_column(var = "effect") %>%
+  filter(effect == "game_score_game") %>%
+  mutate(overall = n1_gmscore + n2_gmscore + n3_gmscore)
+
+y1 <- weights$n1_gmscore
+y2 <- weights$n2_gmscore
+y3 <- weights$n3_gmscore
+ovr <- weights$overall
+```
+
+```{r}
+# avg GS/G and standard deviation so we can convert to z-scores
+mn3 <- nwhl %>%
+  summarise(mean_gmscore = weighted.mean(game_score_game, gp, na.rm = TRUE),
+            sd_gmscore = weighted.sd(game_score_game, gp, na.rm = TRUE))
+
+avg_gmscore <- round(mn3$mean_gmscore, digits = 3)
+sd_gmscore <- round(mn3$sd_gmscore, digits = 3)
+#average nwhl game score per game is about 0.634
+
+nwhl <- nwhl %>%
+  mutate(gmscore_z = ((game_score_game - avg_gmscore) / (sd_gmscore)))
+#looking at average game score and game score relative to average at each age
+data <- nwhl %>% 
+  filter(! is.na(age_in_season) & ! is.na(game_score_game)) %>%
+  group_by(age_in_season) %>%
+  summarise(seasons = n(),
+            gm_score_game = weighted.mean(game_score_game, gp, na.rm = TRUE),
+            z_score = weighted.mean(gmscore_z, gp, na.rm = TRUE))
+```
+
+```{r}
+#Simple Linear Model
+gs_lm <- lm(z_score ~ age_in_season, data = data)
+summary(gs_lm)
+
+#GAM Model
+#weighted by games played in a season to account for players who played a lot
+gs_gam <- gam(gmscore_z ~ I(age_in_season ^ 2) + age_in_season, data = nwhl, weights = gp)
+summary(gs_gam)
+
+#adding predictions
+data$gs_lm <- predict(gs_lm, newdata = data)
+data$gs_gam <- predict(gs_gam, newdata = data)
+```
+
+```{r, include=TRUE}
+n <- nwhl %>%
+  group_by(age_in_season) %>%
+  summarise(Seasons = n())
+
+seasons <- nwhl %>%
+  ggplot() +
+  geom_bar(aes(x = age_in_season), color = "black", fill = "black") +
+  geom_smooth(data = n, aes(x = age_in_season, y = Seasons), color = "forestgreen", 
+              level = 0.1, size = 2) +
+  labs(title = "Games Played Age in the NWHL",
+       y = "Seasons Played", x = "Age in Season",  
+       caption = "@benhowell71 on Twitter | benhowell71.com") + 
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 16),
+        panel.grid.major = element_blank(),
+        plot.caption = element_text(hjust = 0.5, face = "italic"),
+        legend.text = element_text(size = 10),
+        legend.key.size = unit(1.5, 'lines'))
+```
+
+```{r, include=TRUE}
+regregs <- data %>%
+  ggplot() +
+  scale_color_colorblind() +
+  geom_smooth(aes(x = age_in_season, y = z_score, color = "Weighted GS/G"), level = 0.40,
+              size = 2) +
+  geom_smooth(aes(x = age_in_season, y = gs_gam, color = "GAM Curve"), level = 0.4,
+              size = 2) +
+  geom_smooth(aes(x = age_in_season, y = gs_lm, color = "LM Curve"), level = 0.4,
+              size = 2) +
+  labs(title = "Visualizing NWHL Game Score Aging Curves",
+       x = "Age", y = "Game Score Relative to Average",
+       subtitle = "Players look to peak around 24-26 years of age",  
+       caption = "@benhowell71 on Twitter | benhowell71.com") +
+  theme_minimal() +
+  theme(panel.grid.minor = element_blank(),
+        legend.title = element_blank(),
+        plot.title = element_text(hjust = 0.5, size = 15, face = "bold"),
+        plot.subtitle = element_text(hjust = 0.5, size = 12, face = "italic"),
+        plot.caption = element_text(hjust = 0.5, face = "italic"),
+        legend.text = element_text(size = 10),
+        legend.key.size = unit(1.5, 'lines'))
+```
+
+```{r}
+sur <- df %>%
+  knitr::kable(col.names = c("Type of Player", "Seasons", "Total GP", "Avg GP", "Game Score vs Avg"), 
+               align = "ccccc") %>%
+  kable_styling(full_width = FALSE, c("striped", "hover"))
+```
+
+```{r, include=TRUE}
+nwhldf <- nwhl %>%
+  dplyr::select(player:game_score_game, gmscore_z) %>%
+  group_by(player) %>%
+  arrange(player, start_year) %>%
+  mutate(seasons = n(),
+         season_order = row_number(),
+         type = ifelse(seasons == 1, "One-Year", "Survivors")) 
+
+survive <- nwhldf %>%
+  filter(season_order == 1 & start_year != 2020) %>%
+  group_by(type, age_in_season) %>%
+  summarise(seasons = n(),
+            gp_tot = sum(gp, na.rm = TRUE),
+            zgs = round(weighted.mean(gmscore_z, gp, na.rm = TRUE), digits = 3)) %>%
+  mutate(avg_gp = round(gp_tot / seasons, digits = 1)) %>%
+  filter(! is.na(age_in_season)) %>%
+  ggplot() +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "skyblue2", size = 1.5) +
+  geom_smooth(aes(x = age_in_season, y = zgs, color = type), size = 2, level = 0.4) +
+  geom_point(aes(x = age_in_season, y = zgs, color = type), size = 3) +
+  #geom_line(aes(x = age_in_season, y = zgs, color = type), size = 1) +
+  labs(color = "Player Type", x = "Age In First Season", y = "Game Score vs Average",
+       title = "Comparing Game Score in Rookie Season\nFor One-and-Dones and Surviving Players",
+       subtitle = "Survivors play better at nearly all ages",  
+       caption = "@benhowell71 on Twitter | benhowell71.com") +
+  scale_color_colorblind() +
+  theme_minimal() +
+  theme(panel.grid.major = element_blank(),
+        plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+        plot.subtitle = element_text(hjust = 0.5, size = 12, face = "italic"),
+        plot.caption = element_text(hjust = 0.5, face = "italic"),
+        legend.text = element_text(size = 10),
+        legend.key.size = unit(1.5, 'lines'))
+```
+
+```{r}
+data <- data %>%
+  mutate(next_age = age_in_season + 1)
+
+next_season <- data %>%
+  dplyr::select(age_in_season, gs_gam) %>%
+  rename("next_age" = "age_in_season",
+         "next_gs" = "gs_gam")
+
+data <- right_join(data, next_season, by = "next_age")
+
+data <- data %>%
+  mutate(change = next_gs - gs_gam) %>%
+  dplyr::select(next_age, change) %>% 
+  filter(! is.na(change))
+
+avg <- nwhldf %>%
+  group_by(age_in_season) %>%
+  summarise(avg = weighted.mean(game_score_game, gp, na.rm = TRUE),
+            gp2 = mean(gp, na.rm = TRUE)) %>%
+  filter(! is.na(age_in_season))
+
+mn_gs <- weighted.mean(nwhldf$game_score_game, nwhldf$gp, na.rm = TRUE)
+sam_gp <- 2.94
+
+df <- nwhldf %>%
+  dplyr::select(player, end_year, age_in_season, gp, 
+                game_score_game, seasons, season_order) %>%
+  group_by(player) %>%
+  mutate(next_age = age_in_season + 1,
+         max_year = max(end_year),
+         year_relative = max_year - end_year + 1) %>%
+  filter(end_year %in% c(2021, 2020, 2019)) %>%
+  group_by(player) %>% 
+  arrange(player, desc(end_year)) %>%
+  mutate(n1_gs = lead(game_score_game),
+         n2_gs = lead(game_score_game, 2),
+         n1_gp = lead(gp),
+         n2_gp = lead(gp, 2)) %>%
+  dplyr::select(player, next_age, game_score_game, 
+                n1_gs, n2_gs, gp, n1_gp, n2_gp) %>%
+  mutate(two_yr = next_age - 2) %>%
+  right_join(avg, by = c("two_yr" = "age_in_season")) %>%
+  group_by(player) %>%
+  filter(next_age == max(next_age)) %>%
+  filter(! is.na(game_score_game)) %>%
+  right_join(data, by = c("next_age")) %>%
+  #the change that we're adding to this dataframe is the aging effect that
+  #we add in to the prediction to account for the aging up or down
+  mutate(adj_avg = ((avg * gp2) + (avg_gmscore * sam_gp) + 
+                      ((game_score_game / 2) * gp2)) / (gp2 + sam_gp + gp2),
+         test = ((avg * gp2) + (avg_gmscore * sam_gp)) / (gp2 + sam_gp),
+         n1_gs = ifelse(is.na(n1_gs), adj_avg, n1_gs)) %>%
+  #turns out that the default that we put it initially was 
+  #WAYYYYY overestimating things for players who had only 1 season of play
+  #so I added in their game_score_game in their only season 
+  #halved to continue to regress it, bc didn't want to give too much credit to anyone
+  #with just one season of play
+  dplyr::select(player, next_age, game_score_game, 
+                n1_gs, n2_gs, gp, n1_gp, n2_gp, gp2, change) %>%
+  mutate(prediction = ifelse(! is.na(n2_gs),
+    ################################
+    #for players with only 2 seasons of play, we don't add a third regressed season GS/G
+    #if the player had a third year, we use that
+    ((game_score_game * y1) + (n1_gs * y2) + (n2_gs * y3)) / (ovr), 
+    ((game_score_game * y1) + (n1_gs * y2)) / (ovr - y3)),
+  regressed_pred = ((gp * prediction) + (sam_gp * avg_gmscore)) / (gp + sam_gp),
+  age_pred = regressed_pred + change)
+
+ex1 <- df
+
+df <- df %>%
+  dplyr::select(player, next_age, gp, game_score_game, 
+                age_pred, regressed_pred) %>%
+  mutate(change_pred = age_pred - game_score_game)
+  #age pred is the main prediction
+  #need to figure out a better way to account for things for players with 1 GP
+  #bc that get's regressed too far towards average 
+
+small <- nwhldf %>%
+  ungroup() %>%
+  filter(gp > 0 & gp <= 5) %>%
+  summarise(total = n(),
+            gps = sum(gp),
+            avg = weighted.mean(game_score_game, gp)) %>%
+  mutate(avg_gms = round(gps / total, digits = 1))
+
+gms <- small$avg_gms
+small_gms <- small$avg
+
+gm <- nwhldf %>%
+  ungroup() %>%
+  filter(gp > 0) %>%
+  group_by(gp) %>%
+  summarise(total = n(),
+            gps = sum(gp),
+            avg = weighted.mean(game_score_game, gp))
+
+mod <- gam(avg ~ (gp)^2 + gp, data = gm)
+gm$smooth <- predict(mod, newdata = gm)
+
+gm <- gm %>% dplyr::select(gp, smooth)
+
+df <- df %>%
+  left_join(gm, by = "gp") %>%
+  mutate(updated_pred = ifelse(gp > 5, age_pred,
+    ((gp * game_score_game) + (small_gms * gms) + (smooth * gp)) / (gp + gms + gp)),
+    #the MARCEL prediction is our final one
+    #so, for player's with fewer than 5 games played, we add on a few games worth of play
+    #based on the avg GS/G for players w/ less than 5 GP
+    marcel_prediction = ifelse(gp > 5, age_pred,
+    ((gp * game_score_game) + (small_gms * gms)) / (gp + gms))) 
+    #(it's worth noting that when you look at the table of results) 
+    #it will appear as if there's no player's w/ less than 5 GP bc I scaled up from the low 2021 GP 
+    #to the equivalent of whatever percentage of 24 games (a full NWHL season)
+
+ex <- df 
+
+df <- df %>%
+  dplyr::select(player:age_pred, marcel_prediction) %>%
+  mutate(age_pred = round(age_pred, digits = 2),
+         marcel_prediction = round(marcel_prediction, digits = 2))
+#I like how these look
+#they keep the age_pred for players with a lot of GP, but don't overpredict the players who haven't played very much
+
+recent <- nwhl %>%
+  filter(end_year == 2021)
+
+results <- df %>%
+  filter(player %in% recent$player)
+```
+
+```{r}
+play <- nwhldf %>% 
+  dplyr::select(player, seasons) %>%
+  distinct(player, seasons) %>%
+  ungroup() %>%
+  count(seasons)
+
+tab <- play %>%
+  knitr::kable(col.names = c("Seasons Played", "# of Players"), align = "cc") %>%
+  kable_styling(full_width = FALSE, c("striped", "hover"))
+```
+
+*I initially presented my NWHL Aging Curve work at the 2021 WHKYHAC conference, and below is a write-up of my analysis/results. You can view my presentation [here](https://youtu.be/u9Kcx_Vesdg).*
+
+*If you're just here to check out the 2022 NWHL Game Score Projections, scroll down to the bottom of this article to check them out! If you're interested in the analysis and process, keep reading, and you'll get there eventually!*
+
+Aging in sport is a complicated question, but one of the most important ones that we can try to answer or, at the very least, find patterns amongst players. Whether one is working for a team trying to determine who to acquire or a fantasy hockey player looking at who you want on your team next season, having an idea of how their performance may change is super important!                      
+
+In the world of men's sports, there has been plenty of work surrounding aging curves in most of the major men's leagues ([MLB](https://www.baseballprospectus.com/news/article/59972/the-delta-method-revisited/), [NBA](https://link.springer.com/article/10.3758/s13428-018-1183-8), [NHL](https://hockey-graphs.com/2017/03/23/a-new-look-at-aging-curves-for-nhl-skaters-part-1/)). However, aging curves in women's sports have remained relatively unexplored, though there have been two notable aging curves projects in women's hockey, with [Carleen Markey's](https://docs.google.com/presentation/d/1Ej0b_gSgh5R93TE9l9gNBH62meV0AEifvqI2K5dg1FE/edit#slide=id.p) Canadian Women's Hockey League (CWHL) project and [Mike Murphy's NCAA D1](https://hockey-graphs.com/2020/06/25/examining-player-development-in-ncaa-di-womens-hockey-with-game-score-pt-1/) project.                 
+
+The question of aging and its role in projecting performance has interested me for a while, so I decided to work on a project focused on evaluating aging curves in the National Women's Hockey League (NWHL) for the [2021 WHKYHAC Conference](https://www.whkyhac.com/). Below is a write-up of my process and analysis, as well as some of the code I wrote.
+
+******************************************************************
+
+# Where Do We Start?
+
+The first question that needs answering is simple: what metric are we going to use to evaluate players?         
+
+There are a few different options. Carlie's CWHL project used [Offensive Point Shares](https://www.hockey-reference.com/about/point_shares.html), while Mike's used his revamped [Game Score](https://hockey-graphs.com/2019/08/21/revisiting-nwhl-game-score/) to evaluate NCAA skaters. Another option would be to use point totals (goals + assists), but I opted to follow Mike's footsteps and use Game Score per Game (GS/G) to evaluate NWHL skaters.                      
+
+[Game Score](https://hockey-graphs.com/2019/08/21/revisiting-nwhl-game-score/) essentially weights events on the ice by how frequently they occur relative to a goal being scored. You can (and definitely should) read the linked article for more on Game Score, but I've included the NWHL formula below. 
+
+$$Game Score = G + (.9*A1) + (.66*A2) + (.1*SOG) +                   
+(.11 * FOW) - (.11 * FOL) - (.15 * PENT)$$
+
+There are a lot of reasons to use game score, notably that it is *really really* hard for a player to put up a high game score without playing time or *actually* being a good player. For most of this project, I will use GS/G relative to average (z-scores) to evaluate player performance, unless otherwise noted.          
+
+Next up: since this is women's sports analytics, things are never easy, especially with an aging curve project that relies on players having multiple seasons of play strung together. Unfortunately, that's not something we have the luxury of with the NWHL.                
+
+The league has only been around since 2015-2016, and the years since then have not necessarily been...smooth, to put it mildly. We see the effect of that turbulence when we look at how many consecutive seasons have been strung together by NWHL skaters.                  
+
+```{r, include=TRUE}
+tab
+```
+
+Of the 314 player seasons that we have (not including 2020-2021 for now), we see that nearly 55% of all players in the NWHL have only played one season in the league. And there are very very few players who played at least four years in the NWHL.
+
+Furthermore, an additional complicating factor is that most of the games played in NWHL history have been played by players in the 22-26-year-old range. Players rarely play into their 30s due to a multitude of factors, most of which revolve around low salaries. That makes evaluating performance as a function of age kinda tough!
+
+```{r, include=TRUE}
+seasons
+```
+
+These are some things that we'll need to keep in mind as we move forward with our aging curve analysis. But now that I've covered some of the complicating factors, it's time to move forward with the analysis.
+
+******************************************************************
+
+# Delta Method
+
+There are a few ways to go about measuring the effect of aging on GS/G.       
+
+The first is the simplest and perhaps the most intuitive: the delta method, which Carlie and Mike used in their projects.             
+
+The delta method pairs back-to-back seasons for a player and looks at their change in performance from age to age (here, I used true GS/G to evaluate the changes, rather than the aforementioned z-scores). Once enough seasons were paired, I averaged the change in performance for each age bucket (i.e. 21-22, 24-25, 30-31, etc). String them all together, and we have the average change by age, as illustrated below!
+
+<center>
+
+![](delta2.png)
+
+</center>
+
+The age buckets from about 23-28 are the groups where players tend to consistently maintain performance (or, in some cases, increase it). While there are age buckets at 30+ that show increases in performances, the dark red dots indicate how few games played in those age buckets.                   
+
+This is not an ideal method of analysis for the NWHL given the limited dataset, but I wanted to touch on the delta method to build on previous women's hockey aging analyses.              
+
+******************************************************************
+
+# One-and-Done Players vs Survivors
+
+The main weakness of the delta method is that you end up throwing out players who only played one season in their career, as well as the last season of a player's career since they don't have an additional season to pair with.               
+
+Presumably, there's a difference between the players who only play for one season before failing to return to the NWHL and the players who receive another shot in the league. Since the delta method doesn't account for players who fail to "survive", I wanted to directly compare one-and-done and surviving players to see if that difference played out.                                       
+
+Turns out there is a difference!
+
+```{r, include=TRUE}
+sur
+```
+
+Players who make it to a second NWHL season played more as a rookie AND played better than average. Since the one-and-done players aren't included in the delta method, the method likely overrates the quality of player in the league.            
+
+This also shows how important it is for a rookie to produce immediately in the NWHL. Unfortunately, teams don't necessarily have the money or the time to let young players develop, so the only players who make it to year two are the strong performers.                             
+
+*(I think it's worth noting that if an NWHL rookie doesn't get to play, they may be more likely to jump back to a different league, potentially one closer to their home country if they hail from outside North America. While I think this is interesting, I won't be digging any deeper as that is not the focus of this project. Back to the aging curve analysis!)*             
+
+```{r, include=TRUE}
+survive
+```
+
+The graph above looks at GS/G relative to average in a player's rookie year, broken down by age. At nearly every single instance, survivors played better than one-and-done players; the few instances where they didn't are more a result of outliers and the sparse NWHL dataset than a concrete trend.
+
+******************************************************************
+
+# Regression Methods
+
+Moving on from the delta method, I applied two modeling and regression techniques to visualize the aging curve difference.                   
+
+I started with a simple linear regression that looks at the relationship between age and game score. It's a model that performs well by certain metrics, notably with a 0.581 R-squared, while age has a coefficient of -0.06, indicating that every year increase in age should correspond with a slight drop in GS/G relative to average. However, the straight decline in GS/G isn't much of a curve and doesn't make too much sense (though the premise of young players > older players is a simple and defensible one).
+
+```{r, echo=TRUE, eval=FALSE, include=TRUE}
+lr <- lm(game_score_game ~ age_in_season, data = nwhl)
+```
+
+The second method that I tested out uses a Generalized Additive Model (GAM), which produces a curved instance of GS/G relative to age. The GAM produces a curve that starts slightly below average in a player's early 20s before peaking around 24-26 years of age. After that peak, performance decreases as a player ages, an effect that becomes more pronounced the older a player is.              
+
+```{r, echo=TRUE, eval=FALSE, include=TRUE}
+gam_model <- gam(game_score_game ~ I(age_in_season ^ 2) + age_in_season, 
+                 data = nwhl, weights = gp)
+```
+
+If you look closely at the formulas above, you may notice that the linear model does not contain a squared age term while the GAM does. It is possible to run a linear model with the same squared term, however running the linear model with a squared term will produce a curve that is symmetric on both sides, while the GAM does not have that issue. As you see on the graph below, the curve is not symmetric on each side, as the old-age decline is sharper than the young-age increase.               
+
+The last line on the graph (in the blue) is a smoothed plot of the weighted average of GS/G (relative to average) at each age.
+
+```{r, include=TRUE}
+regregs
+```
+
+The modeled curve contradicts some of the findings from Carlie and Mike's projects found, which indicated that the performance of women's hockey players tended to peak early in their career, around ages 21-22. With Mike's NCAA D1 project, that makes sense given that most players tend to age out of college by age 22.            
+
+Carlie's findings were a little more interesting since the CWHL dataset that she used contained players of all ages from 15 to 42. However, as with the NWHL, player movement out of the CWHL was augmented by players sometimes leaving the league before the point where their performance dictated it due to the lower salaries, etc. While the above curve is different from the CWHL aging patterns, the NWHL curve is much more reminiscent of the typical sports aging curve.             
+
+Now, while that is reassuring in one sense, it's important to remember that women's sports and hockey are different from their male counterparts. The goal here is not to produce an aging pattern that mimics the NHL patterns but to produce an accurate representation of aging in the NWHL.           
+
+Despite the complications facing NWHL aging analysis, I believe I've accomplished that, or at least taken a step forward towards understanding how NWHL skaters age. 
+
+******************************************************************
+
+# MARCEL Projections
+
+I had planned to wrap my project up after exploring the linear and GAM regression approaches. However, I couldn't resist applying the aging curves in a concrete fashion.             
+
+Enter NWHL MARCEL Projections for the 2021-2022 season.                 
+
+MARCEL projections were first introduced in [2004 by Tom Tango](http://www.tangotiger.net/archives/stud0346.shtml) to provide a straightforward way to project future MLB production and have begun to trickle in [hockey](https://ownthepuck.wordpress.com/2015/09/05/using-marcels-to-forecast-player-performance-in-hockey/) (that link is super helpful).                        
+
+MARCEL projections are straightforward and relatively simple. They essentially weigh a player's past performance by their most recent seasons, regress their performance to league average (based on playing time), and, finally, apply an aging adjustment.                    
+
+The first step is to determine what the relationship is between a player's performance and their performance in their last 1, 2, and 3 seasons. Looking at those correlations provides us with the weights we use for those seasons.                          
+
+However, we don't have the NWHL data to produce those weights due to the overall lack of consecutive data. However, the aforementioned CWHL data that Carlie used *IS* available. While it's not ideal to use one league to determine weights for a different league, the CWHL and NWHL had quite an overlap in their player pools and similar talent levels. Given the overall constraints, it is what it is.        
+
+But there's a problem!              
+
+We don't have Game Score for the CWHL, so how do we evaluate the relationship between Year N-1, N-2, and N-3 Game Score and current Game Score? Fortunately, there's a strong relationship between goals, assists, and GS in the NWHL, so I decided to model CWHL game score using that NWHL relationship.                  
+
+Running a simple linear model with GS as a function of goals and assists returns a stellar adjusted R-squared of 0.965. I then took a random sample of 578 CWHL game score seasons (to match the NWHL total) and compared their distributions to see if things made sense.            
+
+```{r, include=TRUE}
+gs_graph
+```
+
+The above graph indicates that the distribution of my modeled CWHL game score makes sense. Unsurprisingly, the CWHL Game Scores are more concentrated around average and don't predict as many scores in the 0.75-1.5 range (tbh, there's that bump at ~ 2 GS/G, and I have no clue why, but I don't think it's a problem). Now that I've determined that my modeled CWHL Game Score is not too outlandish, I can move forward with the MARCEL work.             
+
+```{r}
+wei <- weights %>%
+  dplyr::select(effect, n1_gmscore, n2_gmscore, n3_gmscore, overall) %>%
+  mutate(n1_gmscore = round(n1_gmscore, digits = 2),
+         n2_gmscore = round(n2_gmscore, digits = 2),
+         n3_gmscore = round(n3_gmscore, digits = 2),
+         effect = "Game Score Per Game",
+         overall = round(overall, digits = 2)) %>%
+  knitr::kable(col.names = c("Effect", "N-1 GS", "N-2 GS", "N-3 GS", "Total"), align = "ccccc") %>%
+  kable_styling(full_width = FALSE, c("striped", "hover"))
+```
+
+```{r, include=TRUE}
+wei
+```
+
+A player's most recent season plays the biggest part in predicting their future performance. And performance in seasons N-2 and N-3 matter in decreasing order. So, how does one turn this into a MARCEL projection?
+
+Let's take McKenna Brand of the Boston Pride as an example. Below are her stats from her last three seasons, as well as how many games she played in each season (just a reminder that I scaled up her 2020-2021 from 7 games to 24 games and that's her N-1 season).
+
+```{r}
+brand <- ex1 %>%
+  filter(player == "McKenna Brand") %>%
+  mutate(marcel = round(((game_score_game * y1) + (n1_gs * y2) + (n2_gs * y3)) / ovr, digits = 2)) %>%
+  dplyr::select(player, next_age, marcel, game_score_game, gp, n1_gs, n1_gp, n2_gs, n2_gp) %>%
+  knitr::kable(col.names = c("Player", "Age In Next Season", "MARCEL", "N-1 GS/G", "N-1 GP",
+                             "N-2 GS/G", "N-2 GP", "N-3 GS/G", "N-3 GP"), align = "cccccccc") %>%
+  kable_styling(full_width = FALSE, c("striped", "hover")) %>%
+  row_spec(0, italic = TRUE) %>%
+  add_header_above(c(" " = 3, "Season N-1" = 2, "Season N-2" = 2, "Season N-3" = 2))
+```
+
+```{r, include=TRUE}
+brand
+```
+
+Here's how I derived an initial MARCEL projection with the given weights:
+
+$$ MARCEL = ((1.19 * 0.62) + (1.9 * 0.29) + (1.25 * 0.2)) / 1.11 $$
+
+The formula produces a projected game score of 1.39, partway between Brand's GS/G in 2020-2021 and 2019-2020. Passes the smell test! But there's still more we can do to further this projection.                  
+
+Step 2 (or technically like step 6 at this point if we're being honest, but is anyone *really* counting?) is to regress projected performance to average GS/G to ensure that we don't overrate outlier seasons. To do that, I assume the projected 1.39 GS/G comes over 24 games and then add about 3 (actually 2.94) games worth of league average play (a 0.59 GS/G). We determine the average games to add by comparing the true average GS/G, and the initial predicted GS/G (since that has no regression to the mean yet), and how they relate to the average games played.        
+
+In the equation below, 17.32 is the average games played, while 0.855 comes from a comparison of actual and predicted GS/G. While the true average GS/G in 2021 was 0.59, the average predicted GS/G is 0.69 (or 85.5% of that predicted performance).                 
+
+$$ Games = avgGP * ((1 - difference) / difference) $$
+$$ Games = 17.32 * ((1 - 0.855) / 0.855) $$
+
+Solve that, and it comes out to 2.94 games of average production to add. The formula below represents adding in the games of average production, resulting in a regressed projection of 1.30 for McKenna Brand.                   
+
+$$ Regressed = ((1.39 * 24) + (2.94 * 0.59)) / (24 + 2.94) $$
+
+Last but not least, we add in a simple aging effect. Taking the GAM curve that I produced earlier, I paired back-to-back ages together to figure out what the effect of increasing age had on GS/G. For example, since McKenna Brand is going from 24 to 25 years old, we'd expect her GS/G to increase by 0.015 (small differences, but hey, it is what it is).              
+
+All told, McKenna Brand's final projected GS/G comes out to 1.31, the third-highest mark behind Mikyla Grant-Mentis and Brand's teammate, Jillian Dempsey.               
+
+Brand made a good example here because she's played three seasons in a row in the NWHL. But not every player has played that many seasons. For players with two years of NWHL play (think Mikyla Grant-Mentis), the system takes just her two seasons into consideration, weighting by the same weights as earlier (N-1 as 0.62 and N-2 as 0.29, all over 0.91).           
+
+For players with just one season, I add a "second" season to their line. The fake season is their year of play heavily regressed to average with a negative factor applied based on their season of play. The negative factor is intended to keep the system from overrating players whose single season was poor in just a couple of games (when regressing to average, it would pull those seasons too close to average).        
+
+The names that populate the top of the board are the ones that we'd expect. The reigning MVP, Mikyla Grant-Mentis, tops the projections with her game score of 1.91 (though, to be honest, I bet she outperforms that). Stalwart superstar Jillian Dempsey comes in second place at 1.65, then McKenna Brand, followed by their Boston Pride teammate Christina Putigna and her 1.29 prediction.                     
+
+However, the system isn't buying strong seasons from a few players, notably Nina Rogers, Emma Woods, and Brooke Boquist, though I'd probably disagree with the system on them. They are all in that 24-26 sweet spot and (for Woods and Boquist) have 1 season played, resulting in their "fake second season" that is heavily regressed to league average. Given that they produce so well in their rookie season and are in their *prime*, I'd bet on their performance maintaining its 2021 level or even improving.           
+
+The model does penalize players like Alyssa Wohlfeiler (entering her age-32 season), projecting her for a -0.20 decrease in Game Score/Game, the eighth-largest drop in the league. On the flip side, Allie Thunstrom (entering her age-33 season) is expected to rebound from a tough 0.09 GS/G in 2021 and return to being an above-average skater.               
+
+A lot is going on in these projections and I would recommend checking them out in the table below and seeing what sticks out to you!             
+
+Aging in sport, especially women's sports, is a hard problem to attack despite the analysis that understanding aging facilitates. Hopefully, through my presentation and writeup, I've helped provide a framework to view aging using the delta and regression methods, building on previously completed work in the women's hockey sphere.               
+
+```{r}
+play <- nwhldf %>%
+  dplyr::select(player, seasons) %>%
+  distinct()
+
+results <- results %>% 
+  left_join(play, by = c("player"))
+
+results <- results %>%
+  mutate(difference = marcel_prediction - game_score_game,
+         d2 = marcel_prediction - age_pred)
+
+ex1 <- ex1 %>%
+  left_join(play, by = c("player"))
+
+res <- results %>%
+  dplyr::select(player, next_age, game_score_game, marcel_prediction)
+
+min <- -0.07
+max <- 2.14
+
+make_color_pal <- function(colors, bias = 1) {
+  get_color <- colorRamp(colors, bias = bias)
+  function(x) rgb(get_color(x), maxColorValue = 255)
+}
+
+color <- make_color_pal(c("#c62f2d", "#cc7a64", "#f7cec3", "#f7e4df", "#FFFEFE", "#5be04f", "#388223"), bias = 2)
+
+tab <- res %>%
+  mutate(Change = round(marcel_prediction - game_score_game, digits = 2)) %>%
+  arrange(desc(marcel_prediction)) %>%
+  reactable(pagination = FALSE,
+    highlight = TRUE,
+    striped = TRUE,
+    defaultColDef = colDef(
+    align = "center", minWidth = 25, headerClass = "header", headerStyle = list(fontWeight = 700)
+  ),
+  columnGroups = list(
+    colGroup(name = "Player Info", columns = c("player", "next_age")),
+    colGroup(name = "Results", columns = c("game_score_game", "marcel_prediction", "Change")
+  )),
+  theme = reactableTheme(
+    headerStyle = list(
+      "&:hover[aria-sort]" = list(background = "hsl(0, 0%, 96%)"),
+      "&[aria-sort='ascending'], &[aria-sort='descending']" = list(background = "hsl(0, 0%, 96%)"),
+      borderColor = "#555"
+    )),
+  columns = list(
+    player = colDef(
+      name = "Player",
+      class = "border-left"
+    ),
+    next_age = colDef(
+      name = "Next Age"
+    ),
+    game_score_game = colDef(
+      name = "2021 Game Score"
+    ),
+    Change = colDef(
+      name = "Change"
+    ),
+    marcel_prediction = colDef(
+      name = "MARCEL 2022 GS/G",
+      style = function(value) {
+        value
+        normalized <- (value - min) / (max - min)
+        #normalized <- (value - min(pitch_type$RV100)) / (max(pitch_type$RV100) - min(pitch_type$RV100))
+        color <- color(normalized)
+        list(background = color)
+      }
+    )))
+```
+
+```{css}
+.title {
+  margin: 18px 0px;
+  font-size: 16px;
+}
+
+.border-left {
+  border-left: 2px solid #555;
+}
+
+.title h2 {
+  font-size: 20px;
+  font-weight: 600;
+}
+
+.subtitle {
+  margin: 18px 0px;
+  font-size: 3px;
+}
+
+.subtitle h2 {
+  font-size: 14px;
+  #font-weight: 100;
+}
+
+/* Align header text to the bottom */
+.header,
+.group-header {
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+}
+
+.header {
+  border-bottom-color: #555;
+  font-size: 13px;
+  font-weight: 400;
+  #text-transform: uppercase;
+}
+
+/* Highlight headers when sorting */
+.header:hover,
+.header[aria-sort="ascending"],
+.header[aria-sort="descending"] {
+  background-color: #eee;
+}
+
+.standings {
+  font-family: Karla, "Helvetica Neue", Helvetica, Arial, sans-serif;
+  font-size: 14px;
+}
+```
+
+******************************************************************
+
+# 2022 NWHL Projected Game Scores
+
+```{r, include=TRUE}
+tab
+```
+
+***********************************************************
